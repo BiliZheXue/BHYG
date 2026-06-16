@@ -61,9 +61,10 @@ def check_signature() -> str:
             executable_data = f.read()
         data = executable_data[-256:-128]
         data = data.rstrip(b'\x00')
-        print(f"Data to verify: {data}")
+        if not data:
+            print("Warning: No signature data found!")
+            return None
         data_signature = executable_data[-128:]
-        print(f"Data signature: {data_signature}")
         rsa_key = RSA.import_key(RSA_PUBKEY)
         pkcs1_15.new(rsa_key).verify(SHA1.new(data), data_signature)
         return data.decode()
