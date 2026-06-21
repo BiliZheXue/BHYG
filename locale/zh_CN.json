@@ -163,7 +163,7 @@
     "cc_project_id": "项目 ID: {project_id}",
     "cc_screen_id": "场次 ID: {screen_id}",
     "cc_sku_id": "商品 ID: {sku_id}",
-    "cc_ticket_targets": "轮询票档: {ticket_targets}",
+    "cc_ticket_targets": "并发票档: {ticket_targets}",
     "cc_count": "购票数量: {count}",
     "cc_order_type": "订单类型: {order_type}",
     "cc_id_bind_type": "实名类型: {id_bind_type}",
