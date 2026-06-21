@@ -8,6 +8,7 @@ import time
 import httpx
 
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
 import hashlib
@@ -98,6 +99,7 @@ class BHYG(metaclass=ProtectedMeta):
         print("Welcome, " + info.split("|")[0])
         self.last_order_time = 0
         self.last_order_check_time = 0
+        self.order_state_lock = threading.Lock()
         self.voucher = ""
         logger.info("Setting Up Simulated Environment")
         self.client = BilibiliClient()
@@ -544,6 +546,36 @@ class BHYG(metaclass=ProtectedMeta):
         targets = self.config.get("ticket_targets", [])
         return targets if isinstance(targets, list) else []
 
+    def build_ticket_target_config(self, target, index=0):
+        order_config = dict(self.config)
+        count = int(order_config.get("count", 1) or 1)
+        order_config["current_ticket_target_index"] = index
+        order_config["screen_id"] = int(target["screen_id"])
+        order_config["sku_id"] = int(target["sku_id"])
+        order_config["sale_start_time"] = int(target.get("sale_start_time", 0) or 0)
+        order_config["pay_money"] = int(target.get("price", 0)) * count
+        order_config["ticket_name"] = target.get(
+            "ticket_name",
+            f"{target.get('screen_name', '')} {target.get('sku_desc', '')}".strip(),
+        )
+        return order_config
+
+    def get_ticket_target_configs(self):
+        return [
+            self.build_ticket_target_config(target, index)
+            for index, target in enumerate(self.get_ticket_targets())
+        ]
+
+    def get_available_ticket_target_configs(self):
+        target_configs = self.get_ticket_target_configs()
+        now = time.time()
+        return [
+            target_config
+            for target_config in target_configs
+            if target_config.get("sale_start_time", 0) == 0
+            or target_config["sale_start_time"] <= now
+        ]
+
     def apply_ticket_target(self, index=None):
         targets = self.get_ticket_targets()
         if len(targets) == 0:
@@ -552,16 +584,13 @@ class BHYG(metaclass=ProtectedMeta):
             index = self.config.get("current_ticket_target_index", 0)
         index = int(index) % len(targets)
         target = targets[index]
-        count = int(self.config.get("count", 1) or 1)
+        order_config = self.build_ticket_target_config(target, index)
         self.config["current_ticket_target_index"] = index
-        self.config["screen_id"] = int(target["screen_id"])
-        self.config["sku_id"] = int(target["sku_id"])
-        self.config["sale_start_time"] = int(target.get("sale_start_time", 0) or 0)
-        self.config["pay_money"] = int(target.get("price", 0)) * count
-        self.config["ticket_name"] = target.get(
-            "ticket_name",
-            f"{target.get('screen_name', '')} {target.get('sku_desc', '')}".strip(),
-        )
+        self.config["screen_id"] = order_config["screen_id"]
+        self.config["sku_id"] = order_config["sku_id"]
+        self.config["sale_start_time"] = order_config["sale_start_time"]
+        self.config["pay_money"] = order_config["pay_money"]
+        self.config["ticket_name"] = order_config["ticket_name"]
         return target
 
     def advance_ticket_target(self):
@@ -656,7 +685,9 @@ class BHYG(metaclass=ProtectedMeta):
                 logger.debug(f"UID not found, skipping UID check: {self.client.uid}")
         return True
 
-    def get_token(self):
+    def get_token(self, order_config=None):
+        if order_config is not None:
+            return self.prepare_token(order_config)
         # check if expired
         if (
             hasattr(self, "token")
@@ -666,36 +697,42 @@ class BHYG(metaclass=ProtectedMeta):
         # exist
             if time.time() < self.token_exp - 60:
                 # not expired
-                return self.token, self.ptoken
+                return self.token, self.ptoken, getattr(self, "token_gen", time.time())
         # use prepare
-        return self.prepare_token()
+        token, ptoken, token_gen = self.prepare_token()
+        self.token_gen = token_gen
+        return token, ptoken, token_gen
         # NOT AVAILABLE IN OSS
         raise Exception("NOT AVAILABLE IN OSS")
 
-    def prepare_token(self):
+    def prepare_token(self, order_config=None):
         # TODO: Use prepare API to generate token.
+        if order_config is None:
+            order_config = self.config
         while True:
-            random.seed(int(time.time() * 1000))
+            rng = random.Random(
+                int(time.time() * 1000) + int(order_config.get("sku_id", 0))
+            )
             data = {
-                "project_id": self.config["project_id"],
-                "screen_id": self.config["screen_id"],
-                "order_type": self.config["order_type"],
-                "count": self.config["count"],
-                "sku_id": self.config["sku_id"],
-                "buyer_info": self.config["project_buyer_info"],
+                "project_id": order_config["project_id"],
+                "screen_id": order_config["screen_id"],
+                "order_type": order_config["order_type"],
+                "count": order_config["count"],
+                "sku_id": order_config["sku_id"],
+                "buyer_info": order_config["project_buyer_info"],
                 "ignoreRequestLimit": True,
                 "ticket_agent": "",
                 "newRisk": True,
                 "requestSource": "neul-next",
             }
-            if self.config["hotProject"]:
+            if order_config.get("hotProject", False):
                 data["token"] = self.client.generate_ctoken(
-                    touchend=random.randint(1, 5),
-                    beforeunload=random.randint(1, 3),
-                    openWindow=random.randint(1, 3),
+                    touchend=rng.randint(1, 5),
+                    beforeunload=rng.randint(1, 3),
+                    openWindow=rng.randint(1, 3),
                 )
             resp = self.client.post(
-                f"https://show.bilibili.com/api/ticket/order/prepare?project_id={self.config['project_id']}",
+                f"https://show.bilibili.com/api/ticket/order/prepare?project_id={order_config['project_id']}",
                 json=data,
             )
             logger.debug(resp)
@@ -706,7 +743,7 @@ class BHYG(metaclass=ProtectedMeta):
                     data["ptoken"] = ""
                 data["ptoken"] = data["ptoken"].replace("=", "")
                 logger.debug(f"Prepared Token: {data['token']} {data['ptoken']}")
-                self.token_gen = time.time()
+                token_gen = time.time()
                 break
             elif resp["code"] == -401:
                 logger.warning(self.i18n("gaia_detected"))
@@ -716,12 +753,14 @@ class BHYG(metaclass=ProtectedMeta):
                     self.i18n("prepare_token_failed").format(message=resp["message"])
                 )
                 time.sleep(1)
-        return data["token"], data["ptoken"]
+        return data["token"], data["ptoken"], token_gen
 
-    def generate_click_position(self):
+    def generate_click_position(self, token_gen=None):
         # str(self.token_gen) if exist
         origin = (
-            int(self.token_gen * 1000)
+            int(token_gen * 1000)
+            if token_gen is not None
+            else int(self.token_gen * 1000)
             if hasattr(self, "token_gen")
             else int(time.time() * 1000) - random.randint(10000, 20000)
         )
@@ -1121,66 +1160,68 @@ class BHYG(metaclass=ProtectedMeta):
                 self.voucher = resp["data"]["new_voucher"]
                 return True
 
-    def do_order_create(self):
-        if not self.check_select_sku_complete():
-            logger.error(self.i18n("select_sku_not_complete"))
-            return False
-        if not self.check_select_buyer_complete():
-            logger.error(self.i18n("select_buyer_not_complete"))
-            return False
-        self.apply_ticket_target()
-        token, ptoken = self.get_token()
+    def do_order_create(self, order_config=None):
+        if order_config is None:
+            if not self.check_select_sku_complete():
+                logger.error(self.i18n("select_sku_not_complete"))
+                return False
+            if not self.check_select_buyer_complete():
+                logger.error(self.i18n("select_buyer_not_complete"))
+                return False
+            self.apply_ticket_target()
+            order_config = self.config
+        token, ptoken, token_gen = self.get_token(order_config)
         data = {
-            "project_id": self.config["project_id"],
-            "screen_id": self.config["screen_id"],
-            "count": self.config["count"],
-            "pay_money": self.config["pay_money"],
-            "order_type": self.config["order_type"],
+            "project_id": order_config["project_id"],
+            "screen_id": order_config["screen_id"],
+            "count": order_config["count"],
+            "pay_money": order_config["pay_money"],
+            "order_type": order_config["order_type"],
             "timestamp": int(time.time() * 1000),
-            "id_bind": self.config["id_bind"],
-            "need_contact": 1 if self.config["id_bind"] == 0 else 0,
+            "id_bind": order_config["id_bind"],
+            "need_contact": 1 if order_config["id_bind"] == 0 else 0,
             "is_package": 0,
             "package_num": 1,
             "contactInfo": {
                 "uid": self.client.uid,
-                "username": self.config["buyer"]
-                if self.config["id_bind"] == 0
+                "username": order_config["buyer"]
+                if order_config["id_bind"] == 0
                 else None,
-                "tel": self.config["tel"] if self.config["id_bind"] == 0 else None,
+                "tel": order_config["tel"] if order_config["id_bind"] == 0 else None,
             }
-            if self.config["id_bind"] == 0
+            if order_config["id_bind"] == 0
             else None,
-            "sku_id": self.config["sku_id"],
+            "sku_id": order_config["sku_id"],
             "coupon_code": "",
             "again": 0,
             "token": token,
             "deviceId": self.client.devicefp,
             "version": "1.1.0",
         }
-        if self.config["id_bind"] == 1 or self.config["id_bind"] == 2:
-            data["buyer_info"] = json.dumps(self.config["id_buyer"])
+        if order_config["id_bind"] == 1 or order_config["id_bind"] == 2:
+            data["buyer_info"] = json.dumps(order_config["id_buyer"])
             # WATERMARK
             # data["buyer"] = self.policy.get("watermark", "使用免费软件BHYG下单")
             # data["tel"] = "19999999999"
-            if self.is_changfan:
-                data["buyer"] = self.config["buyer"]
-                data["tel"] = self.config["tel"]
+            if order_config.get("is_changfan", False):
+                data["buyer"] = order_config["buyer"]
+                data["tel"] = order_config["tel"]
         else:
-            data["buyer"] = self.config["buyer"]
-            data["tel"] = self.config["tel"]
-        data["clickPosition"] = self.generate_click_position()
-        if self.config["hotProject"]:
+            data["buyer"] = order_config["buyer"]
+            data["tel"] = order_config["tel"]
+        data["clickPosition"] = self.generate_click_position(token_gen)
+        if order_config.get("hotProject", False):
             data["ctoken"] = (
                 self.client.generate_ctoken(
-                    timer=10 + 2 * int(time.time()) - 2 * int(self.token_gen)
+                    timer=10 + 2 * int(time.time()) - 2 * int(token_gen)
                 )
-                if self.config.get("ctoken", "") == ""
-                else self.config.get("ctoken", "")
+                if order_config.get("ctoken", "") == ""
+                else order_config.get("ctoken", "")
             )
             data["ptoken"] = (
                 ptoken
-                if self.config.get("ptoken", "") == ""
-                else self.config.get("ptoken", "")
+                if order_config.get("ptoken", "") == ""
+                else order_config.get("ptoken", "")
             )
             ctoken_bak = data["ctoken"]
             ptoken_bak = data["ptoken"]
@@ -1193,23 +1234,23 @@ class BHYG(metaclass=ProtectedMeta):
         data["newRisk"] = True
         if self.voucher != "":
             data["voucher"] = self.voucher
-        if self.config.get("is_changfan", True):
-            data["link_id"] = self.config["linkgood_id"]
+        if order_config.get("is_changfan", False):
+            data["link_id"] = order_config["linkgood_id"]
         logger.debug("Creating order with data...")
         logger.debug(data)
         # TEST 429 BYPASS MARKER
         # TEST 412 BYPASS MARKER
         # NOT AVAILABLE IN OSS
 
-        if self.config.get("ip", None) is not None:
+        if order_config.get("ip", None) is not None:
             resp = self.client.post(
-                f"{self.order_base}/api/ticket/order/createV2?project_id={self.config['project_id']}{'&ptoken=' + ptoken if self.config['hotProject'] else ''}",
-                ip=self.config["ip"],
+                f"{self.order_base}/api/ticket/order/createV2?project_id={order_config['project_id']}{'&ptoken=' + ptoken if order_config.get('hotProject', False) else ''}",
+                ip=order_config["ip"],
                 json=data,
             )
         else:
             resp = self.client.post(
-                f"{self.order_base}/api/ticket/order/createV2?project_id={self.config['project_id']}{'&ptoken=' + ptoken if self.config['hotProject'] else ''}",
+                f"{self.order_base}/api/ticket/order/createV2?project_id={order_config['project_id']}{'&ptoken=' + ptoken if order_config.get('hotProject', False) else ''}",
                 json=data,
             )
         logger.debug("Order create response:")
@@ -1222,7 +1263,7 @@ class BHYG(metaclass=ProtectedMeta):
             order_token = resp["data"]["token"]
             try:
                 resp = self.client.get(
-                    f"https://show.bilibili.com/api/ticket/order/createstatus?orderId={order_id}&project_id={self.config['project_id']}&token={order_token}",
+                    f"https://show.bilibili.com/api/ticket/order/createstatus?orderId={order_id}&project_id={order_config['project_id']}&token={order_token}",
                     headers={
                         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 BHYG/66666"
                     },
@@ -1248,19 +1289,19 @@ class BHYG(metaclass=ProtectedMeta):
             )
             logger.debug(f"Order ID: {order_id} Push Config: {push_config}")
             buyers = ""
-            if self.config["id_bind"] == 0:
-                buyers = self.config["buyer"]
-            elif self.config["id_bind"] == 1 or self.config["id_bind"] == 2:
+            if order_config["id_bind"] == 0:
+                buyers = order_config["buyer"]
+            elif order_config["id_bind"] == 1 or order_config["id_bind"] == 2:
                 buyers = ", ".join(
                     [
                         f"{buyer['name'][0]}{'*' * (len(buyer['name']) - 1)}"
-                        for buyer in self.config["id_buyer"]
+                        for buyer in order_config["id_buyer"]
                     ]
                 )
             logger.info(
                 self.i18n("order_success_info").format(
                     order_id=order_id,
-                    ticket_name=self.config.get("ticket_name", "未知"),
+                    ticket_name=order_config.get("ticket_name", "未知"),
                     buyers=buyers,
                     username=self.client.username,
                 )
@@ -1277,7 +1318,7 @@ class BHYG(metaclass=ProtectedMeta):
                 if do_push(
                     push_config,
                     order_id,
-                    self.config.get("ticket_name", "未知"),
+                    order_config.get("ticket_name", "未知"),
                     buyers,
                     self.client.username,
                     code_url=img_base64,
@@ -1296,9 +1337,11 @@ class BHYG(metaclass=ProtectedMeta):
             logger.error(self.i18n("503_service_unavailable"))
         # MODEL: STAGE 0
         elif resp["code"] == 412:
-            self.count_412 += 1
+            with self.order_state_lock:
+                self.count_412 += 1
+                count_412 = self.count_412
             logger.error(self.i18n("412_controlled"))
-            if self.count_412 >= 20:
+            if count_412 >= 20:
                 time.sleep(300)
             time.sleep(1)
         # MODEL: STAGE 1
@@ -1325,8 +1368,10 @@ class BHYG(metaclass=ProtectedMeta):
                     pay_money=resp["data"]["pay_money"]
                 )
             )
-            self.config["pay_money"] = resp["data"]["pay_money"]
-            self.save_config()
+            order_config["pay_money"] = resp["data"]["pay_money"]
+            if order_config is self.config:
+                self.config["pay_money"] = resp["data"]["pay_money"]
+                self.save_config()
         # MODEL: STAGE 3
         elif resp["code"] == 3:
             logger.warning(self.i18n("5s_shielded"))
@@ -1335,23 +1380,25 @@ class BHYG(metaclass=ProtectedMeta):
         elif resp["code"] == 219:
             logger.warning(self.i18n("219_stock_not_enough"))
         else:
-            self.last_order_check_time = time.time()
+            with self.order_state_lock:
+                self.last_order_check_time = time.time()
             # self.last_order_time = time.time()
             logger.error(
                 self.i18n("order_create_failed").format(
                     message=resp["message"], code=resp["code"]
                 )
             )
-        if resp["code"] != 412:
-            self.count_412 = 0
-        if (
-            resp["code"] in range(100000, 100100)
-            or resp["code"] in range(200, 299)
-            or resp["code"] in [900002, 3]
-        ):
-            self.last_order_check_time = time.time()
-        if resp["code"] in range(200, 299):
-            self.last_order_time = time.time()
+        with self.order_state_lock:
+            if resp["code"] != 412:
+                self.count_412 = 0
+            if (
+                resp["code"] in range(100000, 100100)
+                or resp["code"] in range(200, 299)
+                or resp["code"] in [900002, 3]
+            ):
+                self.last_order_check_time = time.time()
+            if resp["code"] in range(200, 299):
+                self.last_order_time = time.time()
         return False
 
     def test_push(self):
@@ -1408,12 +1455,14 @@ class BHYG(metaclass=ProtectedMeta):
         else:
             logger.error(self.i18n("push_config_not_found"))
 
-    def check_stock(self):
+    def check_stock(self, order_config=None):
+        if order_config is None:
+            order_config = self.config
         url = "https://show.bilibili.com/api/ticket/stock/check"
         data = {
-            "projectId": str(self.config["project_id"]),
-            "skuId": int(self.config["sku_id"]),
-            "screenId": int(self.config["screen_id"]),
+            "projectId": str(order_config["project_id"]),
+            "skuId": int(order_config["sku_id"]),
+            "screenId": int(order_config["screen_id"]),
         }
         response = self.client.post(url, json=data)
         logger.debug(response)
@@ -1426,6 +1475,151 @@ class BHYG(metaclass=ProtectedMeta):
             # HAS_STOCK: 3
             return response["data"].get("stockStatus", 0) == 3
             # return True
+
+    def wait_order_interval(self):
+        with self.order_state_lock:
+            last_order_time = self.last_order_time
+            last_order_check_time = self.last_order_check_time
+        if (last_order_time + 5 - self.config.get("delta", 0.05)) - time.time() > 0:
+            time.sleep(
+                (last_order_time + 5 - self.config.get("delta", 0.05))
+                - time.time()
+            )
+        elif (
+            last_order_check_time + 1 - self.config.get("delta", 0.05)
+        ) - time.time() > 0:
+            time.sleep(
+                (last_order_check_time + 1 - self.config.get("delta", 0.05))
+                - time.time()
+            )
+        else:
+            time.sleep(self.config.get("order_interval", 0.3))
+
+    def wait_until_any_ticket_target_available(self):
+        target_configs = self.get_ticket_target_configs()
+        if len(target_configs) == 0:
+            return []
+        available_configs = self.get_available_ticket_target_configs()
+        if len(available_configs) > 0:
+            return available_configs
+        earliest_config = min(
+            target_configs,
+            key=lambda target_config: int(
+                target_config.get("sale_start_time", 0) or 0
+            ),
+        )
+        self.apply_ticket_target(earliest_config["current_ticket_target_index"])
+        if earliest_config["sale_start_time"] == 0:
+            return target_configs
+        logger.info(
+            self.i18n("wait_until_sale_start").format(
+                time=int(earliest_config["sale_start_time"] - time.time()) / 60
+            )
+        )
+        while earliest_config["sale_start_time"] - 5 > time.time():
+            time.sleep(2)
+            logger.info(
+                self.i18n("wait_until_sale_start").format(
+                    time=int(earliest_config["sale_start_time"] - time.time()) / 60
+                )
+            )
+        logger.info(self.i18n("ready_to_sale"))
+        prereq_resp = self.client.session.head("https://show.bilibili.com")
+        logger.debug(prereq_resp.headers)
+        while (
+            earliest_config["sale_start_time"]
+            + self.config.get("after_sale_begin_delay", 0.3)
+            > time.time()
+        ):
+            continue
+        return self.get_available_ticket_target_configs()
+
+    def get_ordering_buyers_text(self):
+        if self.config["id_bind"] == 0:
+            return self.config["buyer"]
+        if self.config["id_bind"] == 1 or self.config["id_bind"] == 2:
+            return ", ".join(
+                [
+                    f"{buyer['name'][0]}{'*' * (len(buyer['name']) - 1)}"
+                    for buyer in self.config["id_buyer"]
+                ]
+            )
+        return ""
+
+    def run_concurrent_stock_check(self, order_configs):
+        available_configs = []
+        with ThreadPoolExecutor(max_workers=len(order_configs)) as executor:
+            future_to_config = {
+                executor.submit(self.check_stock, order_config): order_config
+                for order_config in order_configs
+            }
+            for future in as_completed(future_to_config):
+                order_config = future_to_config[future]
+                try:
+                    if future.result():
+                        logger.info(
+                            f"{self.i18n('stock_available')} {order_config.get('ticket_name', '未知')}"
+                        )
+                        available_configs.append(order_config)
+                except Exception as e:
+                    logger.exception(e)
+        return available_configs
+
+    def run_concurrent_order_create(self, order_configs):
+        order_success = False
+        with ThreadPoolExecutor(max_workers=len(order_configs)) as executor:
+            future_to_config = {
+                executor.submit(self.do_order_create, order_config): order_config
+                for order_config in order_configs
+            }
+            for future in as_completed(future_to_config):
+                try:
+                    order_success = future.result() or order_success
+                except Exception as e:
+                    logger.exception(e)
+        return order_success
+
+    def rush_mode_concurrent_targets(self):
+        count = 0
+        while True:
+            try:
+                order_configs = self.wait_until_any_ticket_target_available()
+            except KeyboardInterrupt:
+                logger.error(self.i18n("canceled"))
+                return False
+            if len(order_configs) == 0:
+                logger.error(self.i18n("select_sku_not_complete"))
+                return False
+            count += 1
+            if count % 30 == 0:
+                logger.info(
+                    self.i18n("ordering").format(
+                        ticket_name=", ".join(
+                            [
+                                order_config.get("ticket_name", "未知")
+                                for order_config in order_configs
+                            ]
+                        ),
+                        buyers=self.get_ordering_buyers_text(),
+                        username=self.client.username,
+                    )
+                )
+            if self.config.get("enable_check_stock", True):
+                order_configs = self.run_concurrent_stock_check(order_configs)
+                if len(order_configs) == 0:
+                    logger.info(self.i18n("no_stock"))
+                    continue
+                time.sleep(self.config.get("stock_check_available_dalay", 0))
+            if self.run_concurrent_order_create(order_configs):
+                try:
+                    logger.info(self.i18n("order_success_wait"))
+                    time.sleep(60 * 10)
+                    continue
+                except KeyboardInterrupt:
+                    logger.info(self.i18n("order_success_wait_interrupted"))
+                    break
+            else:
+                self.wait_order_interval()
 
     def rush_mode(self):
         if not self.check_select_sku_complete():
@@ -1443,6 +1637,8 @@ class BHYG(metaclass=ProtectedMeta):
         if "sale_start_time" not in self.config or self.config["sale_start_time"] == 0:
             logger.warning(self.i18n("sale_start_time_not_found"))
         self.count_412 = 0
+        if len(self.get_ticket_targets()) > 0:
+            return self.rush_mode_concurrent_targets()
         count = 0
         stock_check_count = 0
         while True:
