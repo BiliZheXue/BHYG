@@ -7,7 +7,6 @@ import os
 import atexit
 import qrcode
 import questionary
-import sentry_sdk
 from loguru import logger
 
 from api import BHYG
@@ -39,18 +38,6 @@ def is_terminal_available():
 
 def exit_handler():
     logger.info("Exiting...")
-    sentry_sdk.capture_message(
-        "Exit",
-        level="info",
-    )
-    sentry_sdk.flush()
-    import time
-
-    logger.info("Wait 10s to exit...")
-    try:
-        time.sleep(10)
-    except KeyboardInterrupt:
-        sys.exit(1)
     return
 
 def select_ticket():
@@ -84,7 +71,6 @@ def select_ticket():
         )
         return
     client.config["project_id"] = int(project_id)
-    sentry_sdk.set_tag("project_id", project_id)
     logger.info(client.i18n("project_name").format(name=resp["data"]["name"]))
     ticket_name = f"{resp['data']['name']} "
     client.config["hotProject"] = resp["data"].get("hotProject", False)
@@ -151,6 +137,8 @@ def select_ticket():
         ))
         if_use_prefill = questionary.confirm(client.i18n("use_prefill_base_info")).ask()
         if if_use_prefill:
+            client.config.pop("ticket_targets", None)
+            client.config.pop("current_ticket_target_index", None)
             client.config["screen_id"] = int(screenId) if screenId else None
             client.config["sku_id"] = int(skuId) if skuId else None
             client.config["sale_start_time"] = int(time.mktime(time.strptime(prefilled_sku["sale_start"], "%Y-%m-%d %H:%M:%S"))) if prefilled_sku and prefilled_sku.get("sale_start", None) else None
@@ -247,51 +235,95 @@ def select_ticket():
         if len(screens) == 0:
             logger.warning(client.i18n("no_screen"))
             return
-    screen = questionary.select(
-        client.i18n("select_screen"),
-        choices=[
-            questionary.Choice(
-                client.i18n("screen_info").format(
-                    name=screen["name"],
-                    sale_status=SALE_STATUS_MAP[screen["sale_flag_number"]],
-                ),
-                value=screen,
+    if client.config.get("is_changfan", False):
+        screen = questionary.select(
+            client.i18n("select_screen"),
+            choices=[
+                questionary.Choice(
+                    client.i18n("screen_info").format(
+                        name=screen["name"],
+                        sale_status=SALE_STATUS_MAP[screen["sale_flag_number"]],
+                    ),
+                    value=screen,
+                )
+                for screen in screens
+            ],
+        ).ask()
+        if not screen:
+            logger.info(client.i18n("canceled"))
+            return
+        client.config["screen_id"] = int(screen["id"])
+        ticket_name += f"{screen['name']} "
+        sku = questionary.select(
+            client.i18n("select_sku"),
+            choices=[
+                questionary.Choice(
+                    client.i18n("sku_info").format(
+                        name=sku["desc"],
+                        price=sku["price"] / 100,
+                        sale_status=SALE_STATUS_MAP[sku["sale_flag_number"]],
+                    ),
+                    value=sku,
+                )
+                for sku in screen["ticket_list"]
+            ],
+        ).ask()
+        if not sku:
+            logger.info(client.i18n("canceled"))
+            return
+        try:
+            client.config["sale_start_time"] = int(
+                time.mktime(time.strptime(sku["sale_start"], "%Y-%m-%d %H:%M:%S"))
             )
-            for screen in screens
-        ],
-    ).ask()
-    if not screen:
-        logger.info(client.i18n("canceled"))
-        return
-    client.config["screen_id"] = int(screen["id"])
-    ticket_name += f"{screen['name']} "
-    sku = questionary.select(
-        client.i18n("select_sku"),
-        choices=[
-            questionary.Choice(
-                client.i18n("sku_info").format(
-                    name=sku["desc"],
-                    price=sku["price"] / 100,
-                    sale_status=SALE_STATUS_MAP[sku["sale_flag_number"]],
-                ),
-                value=sku,
-            )
-            for sku in screen["ticket_list"]
-        ],
-    ).ask()
-    if not sku:
-        logger.info(client.i18n("canceled"))
-        return
-    try:
-        client.config["sale_start_time"] = int(
-            time.mktime(time.strptime(sku["sale_start"], "%Y-%m-%d %H:%M:%S"))
-        )
-    except ValueError:
-        logger.warning(client.i18n("sale_start_time_not_found"))
-        client.config["sale_start_time"] = 0
-    client.config["pay_money"] = sku["price"]
-    client.config["sku_id"] = int(sku["id"])
-    ticket_name += f"{sku['desc']}"
+        except ValueError:
+            logger.warning(client.i18n("sale_start_time_not_found"))
+            client.config["sale_start_time"] = 0
+        client.config["pay_money"] = sku["price"]
+        client.config["sku_id"] = int(sku["id"])
+        ticket_name += f"{sku['desc']}"
+        client.config.pop("ticket_targets", None)
+        client.config.pop("current_ticket_target_index", None)
+    else:
+        target_choices = []
+        for screen in screens:
+            for sku in screen["ticket_list"]:
+                target_ticket_name = f"{resp['data']['name']} {screen['name']} {sku['desc']}"
+                try:
+                    sale_start_time = int(
+                        time.mktime(time.strptime(sku["sale_start"], "%Y-%m-%d %H:%M:%S"))
+                    )
+                except ValueError:
+                    sale_start_time = 0
+                target_choices.append(
+                    questionary.Choice(
+                        f"{screen['name']} | {client.i18n('sku_info').format(name=sku['desc'], price=sku['price'] / 100, sale_status=SALE_STATUS_MAP[sku['sale_flag_number']])}",
+                        value={
+                            "screen_id": int(screen["id"]),
+                            "sku_id": int(sku["id"]),
+                            "screen_name": screen["name"],
+                            "sku_desc": sku["desc"],
+                            "price": int(sku["price"]),
+                            "sale_start_time": sale_start_time,
+                            "ticket_name": target_ticket_name,
+                        },
+                    )
+                )
+        ticket_targets = questionary.checkbox(
+            client.i18n("select_sku"),
+            choices=target_choices,
+            validate=lambda targets: len(targets) > 0,
+        ).ask()
+        if not ticket_targets:
+            logger.info(client.i18n("canceled"))
+            return
+        client.config["ticket_targets"] = ticket_targets
+        client.config["current_ticket_target_index"] = 0
+        first_target = ticket_targets[0]
+        client.config["screen_id"] = first_target["screen_id"]
+        client.config["sku_id"] = first_target["sku_id"]
+        client.config["sale_start_time"] = first_target["sale_start_time"]
+        client.config["pay_money"] = first_target["price"]
+        client.config["ticket_name"] = first_target["ticket_name"]
     client.config["count"] = questionary.text(
         client.i18n("select_count"), validate=lambda text: text.isdigit()
     ).ask()
@@ -301,16 +333,19 @@ def select_ticket():
     client.config["count"] = int(client.config["count"])
     logger.warning(client.i18n("unsupported_order_type_warining"))
     client.config["order_type"] = 1
-    client.config["pay_money"] = questionary.text(
-        client.i18n("select_pay_money"),
-        validate=lambda text: text.isdigit(),
-        default=str(client.calculate_pay_money()),
-    ).ask()
-    if not client.config["pay_money"]:
-        logger.info(client.i18n("canceled"))
-        return
-    client.config["pay_money"] = int(client.config["pay_money"])
-    client.config["ticket_name"] = ticket_name
+    if client.config.get("ticket_targets"):
+        client.apply_ticket_target(0)
+    else:
+        client.config["pay_money"] = questionary.text(
+            client.i18n("select_pay_money"),
+            validate=lambda text: text.isdigit(),
+            default=str(client.calculate_pay_money()),
+        ).ask()
+        if not client.config["pay_money"]:
+            logger.info(client.i18n("canceled"))
+            return
+        client.config["pay_money"] = int(client.config["pay_money"])
+        client.config["ticket_name"] = ticket_name
     # TODO: Order Type
     # 1. 正常
     # 2. group_buy promotion 团购
@@ -438,10 +473,6 @@ def main():
     client = BHYG()
 
     while True:
-        sentry_sdk.capture_message(
-            "Entered Main Menu",
-            level="info",
-        )
         main_menu = [
             client.i18n("select_ticket_info"),
             client.i18n("select_buyer"),
@@ -918,9 +949,8 @@ def main():
                                     )
                         except Exception as e:
                             logger.exception(e)
-                            track = sentry_sdk.capture_exception(e)
                             logger.error(
-                                client.i18n("error_occurred").format(trace=track)
+                                client.i18n("error_occurred").format(trace=repr(e))
                             )
                             continue
                 elif action == client.i18n("test_push"):
@@ -1021,10 +1051,6 @@ def main():
                         logger.error(client.i18n("clean_cache_failed").format(error=e))
                 elif action == None or action == client.i18n("exit"):
                     logger.info(client.i18n("exit"))
-                    sentry_sdk.capture_message(
-                        "Exit",
-                        level="info",
-                    )
                     normal_exit = True
                     sys.exit(0)
                 else:
@@ -1036,6 +1062,5 @@ def main():
                 raise
         except Exception as e:
             logger.exception(e)
-            track = sentry_sdk.capture_exception(e)
-            logger.error(client.i18n("error_occurred").format(trace=track))
+            logger.error(client.i18n("error_occurred").format(trace=repr(e)))
             continue

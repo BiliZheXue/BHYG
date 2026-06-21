@@ -16,9 +16,6 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.primitives import hashes
 import questionary
-from sentry_sdk.scrubber import EventScrubber
-from sentry_sdk.integrations.loguru import LoguruIntegration, LoggingLevels
-import sentry_sdk
 
 from bilibili_util import BilibiliClient
 from loguru import logger
@@ -95,20 +92,6 @@ class BHYG(metaclass=ProtectedMeta):
             )
             logger.success("Debug mode is ON")
         logger.info(f"Machine ID: {self.machine_id}")
-        sentry_loguru = LoguruIntegration(
-            level=LoggingLevels.DEBUG.value, event_level=LoggingLevels.CRITICAL.value
-        )
-        sentry_sdk.init(
-            dsn="https://da1bda709a249bb7d7ccfbfda4be1c91@sentry-inc.rakuyoudesu.com/4",
-            release=VERSION,
-            environment="debug" if self.DEBUG else "production",
-            attach_stacktrace=True,
-            integrations=[sentry_loguru],
-            send_default_pii=True,
-            event_scrubber=EventScrubber(denylist=[], pii_denylist=[]),
-            traces_sample_rate=1.0,
-        )
-        sentry_sdk.set_tag("machine_id", self.machine_id)
         info = security.check_signature()
         if info is None:
             sys.exit(1)
@@ -116,7 +99,6 @@ class BHYG(metaclass=ProtectedMeta):
         self.last_order_time = 0
         self.last_order_check_time = 0
         self.voucher = ""
-        self.collect_qq_login_info()
         logger.info("Setting Up Simulated Environment")
         self.client = BilibiliClient()
         self.client.init_show_cookies()
@@ -149,12 +131,7 @@ class BHYG(metaclass=ProtectedMeta):
             is_login, data = self.client.check_login()
             if is_login:
                 logger.info(self.i18n("welcome_login").format(username=data["uname"]))
-                sentry_sdk.set_user({"id": data["mid"]})
                 self.cred = self.client._cookies
-                sentry_sdk.capture_message(
-                    "Logined",
-                    level="info",
-                )
                 self.check_follow()
                 logger.success(self.i18n("not_recommend_exit_force"))
                 logger.info(self.i18n("timezone_recommended"))
@@ -178,10 +155,6 @@ class BHYG(metaclass=ProtectedMeta):
         if uid is None:
             if on_start:
                 logger.info(self.i18n("exit"))
-                sentry_sdk.capture_message(
-                    "Exit",
-                    level="info",
-                )
                 sys.exit(0)
             logger.error(self.i18n("canceled"))
             return
@@ -239,23 +212,6 @@ class BHYG(metaclass=ProtectedMeta):
     def time(self):
         return time.time()
 
-    def collect_qq_login_info(self):
-        self.qqids = []
-        if sys.platform == "win32":
-            user_profile = os.environ["USERPROFILE"]
-            if os.path.exists(
-                f"{user_profile}\\Documents\\Tencent Files\\nt_qq\\global\\nt_data\\Login"
-            ):
-                # list files
-                files = os.listdir(
-                    f"{user_profile}\\Documents\\Tencent Files\\nt_qq\\global\\nt_data\\Login"
-                )
-                for file in files:
-                    self.qqids.append(file.split(".")[1])
-        logger.debug(self.qqids)
-        if len(self.qqids) != 0:
-            sentry_sdk.set_tag("qq", " ".join(self.qqids))
-
     def decrypt_aes(self, data: str) -> str:
         try:
             key = hashlib.md5(self.machine_id.encode()).hexdigest().encode()[:16]
@@ -296,7 +252,6 @@ class BHYG(metaclass=ProtectedMeta):
                 self.first_start = False
                 file_content = f.read()
                 data = json.loads(self.decrypt_aes(file_content))
-                sentry_sdk.set_context("config", data)
                 logger.debug(f"Config content: {data}")
                 self.config = data
                 self.load_session()
@@ -312,7 +267,6 @@ class BHYG(metaclass=ProtectedMeta):
 
     def save_config(self):
         self.config["version"] = VERSION
-        sentry_sdk.set_context("config", self.config)
         self.ensure_config_folder()
         self.save_session()
         try:
@@ -357,9 +311,6 @@ class BHYG(metaclass=ProtectedMeta):
                         self.i18n("session_decrypt_failed").format(error=e)
                     )
                     return
-                sentry_sdk.set_context(
-                    "session_token", dict(self.client.session.cookies)
-                )
         except Exception as e:
             logger.error(self.i18n("load_session_failed").format(error=e))
 
@@ -589,7 +540,73 @@ class BHYG(metaclass=ProtectedMeta):
                 logger.error(self.i18n("gaia_type_not_supported"))
                 return False
 
+    def get_ticket_targets(self):
+        targets = self.config.get("ticket_targets", [])
+        return targets if isinstance(targets, list) else []
+
+    def apply_ticket_target(self, index=None):
+        targets = self.get_ticket_targets()
+        if len(targets) == 0:
+            return None
+        if index is None:
+            index = self.config.get("current_ticket_target_index", 0)
+        index = int(index) % len(targets)
+        target = targets[index]
+        count = int(self.config.get("count", 1) or 1)
+        self.config["current_ticket_target_index"] = index
+        self.config["screen_id"] = int(target["screen_id"])
+        self.config["sku_id"] = int(target["sku_id"])
+        self.config["sale_start_time"] = int(target.get("sale_start_time", 0) or 0)
+        self.config["pay_money"] = int(target.get("price", 0)) * count
+        self.config["ticket_name"] = target.get(
+            "ticket_name",
+            f"{target.get('screen_name', '')} {target.get('sku_desc', '')}".strip(),
+        )
+        return target
+
+    def advance_ticket_target(self):
+        targets = self.get_ticket_targets()
+        if len(targets) == 0:
+            return None
+        current_index = int(self.config.get("current_ticket_target_index", 0) or 0)
+        return self.apply_ticket_target(current_index + 1)
+
+    def apply_available_ticket_target(self):
+        targets = self.get_ticket_targets()
+        if len(targets) == 0:
+            return None
+        now = time.time()
+        start_index = int(self.config.get("current_ticket_target_index", 0) or 0)
+        for offset in range(len(targets)):
+            index = (start_index + offset) % len(targets)
+            sale_start_time = int(targets[index].get("sale_start_time", 0) or 0)
+            if sale_start_time == 0 or sale_start_time <= now:
+                return self.apply_ticket_target(index)
+        earliest_index = min(
+            range(len(targets)),
+            key=lambda i: int(targets[i].get("sale_start_time", 0) or 0),
+        )
+        return self.apply_ticket_target(earliest_index)
+
     def check_select_sku_complete(self):
+        ticket_targets = self.get_ticket_targets()
+        if len(ticket_targets) > 0:
+            if (
+                "project_id" not in self.config
+                or "id_bind" not in self.config
+                or "count" not in self.config
+                or "order_type" not in self.config
+            ):
+                return False
+            for target in ticket_targets:
+                if (
+                    "screen_id" not in target
+                    or "sku_id" not in target
+                    or "price" not in target
+                ):
+                    return False
+            self.apply_ticket_target()
+            return True
         if (
             "project_id" not in self.config
             or "screen_id" not in self.config
@@ -955,11 +972,6 @@ class BHYG(metaclass=ProtectedMeta):
             logger.debug(resp)
             if resp["code"] == 0:
                 logger.success(self.i18n("rush_bws_success"))
-                sentry_sdk.set_tag("bws_reserve_id", reserve_id)
-                sentry_sdk.capture_message(
-                    "Rush BWS Success",
-                    level="info",
-                )
                 return True
             if resp["code"] == 412:
                 logger.error(self.i18n("bws_code_412"))
@@ -1116,6 +1128,7 @@ class BHYG(metaclass=ProtectedMeta):
         if not self.check_select_buyer_complete():
             logger.error(self.i18n("select_buyer_not_complete"))
             return False
+        self.apply_ticket_target()
         token, ptoken = self.get_token()
         data = {
             "project_id": self.config["project_id"],
@@ -1234,17 +1247,6 @@ class BHYG(metaclass=ProtectedMeta):
                 else {"push_actions": []}
             )
             logger.debug(f"Order ID: {order_id} Push Config: {push_config}")
-            sentry_sdk.set_tag("order_id", str(order_id))
-            sentry_sdk.set_tag("order_project_id", self.config["project_id"])
-            sentry_sdk.set_tag("order_screen_id", self.config["screen_id"])
-            sentry_sdk.set_tag("order_sku_id", self.config["sku_id"])
-            sentry_sdk.set_tag(
-                "order_buyer_id",
-                " ".join([str(buyer["id"]) for buyer in self.config["id_buyer"]])
-                if self.config["id_bind"] == 1 or self.config["id_bind"] == 2
-                else self.config["buyer"],
-            )
-            sentry_sdk.capture_message(f"Order Success", level="info")
             buyers = ""
             if self.config["id_bind"] == 0:
                 buyers = self.config["buyer"]
@@ -1263,27 +1265,6 @@ class BHYG(metaclass=ProtectedMeta):
                     username=self.client.username,
                 )
             )
-            try:
-                self.client.post(
-                    f"https://report.rakuyoudesu.com/report",
-                    json={
-                        "app": "bhyg",
-                        "version": VERSION,
-                        "type": "ordered",
-                        "data": {
-                            "id": self.client.uid,
-                            "order_id": order_id,
-                            "sku_id": self.config["sku_id"],
-                            "screen_id": self.config["sku_id"],
-                            "project_id": self.config["project_id"],
-                            "username": self.client.username,
-                            "machine_id": self.machine_id,
-                            "buyers": buyers,
-                        },
-                    },
-                )
-            except:
-                pass
             if len(push_config["push_actions"]) > 0:
                 # img to base64
                 import base64
@@ -1465,6 +1446,7 @@ class BHYG(metaclass=ProtectedMeta):
         count = 0
         stock_check_count = 0
         while True:
+            self.apply_available_ticket_target()
             if self.config["sale_start_time"] > time.time():
                 logger.info(
                     self.i18n("wait_until_sale_start").format(
@@ -1525,6 +1507,8 @@ class BHYG(metaclass=ProtectedMeta):
             ):
                 if not self.check_stock():
                     logger.info(self.i18n("no_stock"))
+                    if self.advance_ticket_target() is not None:
+                        stock_check_count = 0
                     continue
                 else:
                     logger.info(self.i18n("stock_available"))
@@ -1538,6 +1522,8 @@ class BHYG(metaclass=ProtectedMeta):
                 try:
                     logger.info(self.i18n("order_success_wait"))
                     time.sleep(60 * 10)
+                    if self.advance_ticket_target() is not None:
+                        stock_check_count = 0
                     continue
                 except KeyboardInterrupt:
                     logger.info(self.i18n("order_success_wait_interrupted"))
@@ -1563,6 +1549,8 @@ class BHYG(metaclass=ProtectedMeta):
                     )
                 else:
                     time.sleep(self.config.get("order_interval", 0.3))
+                if self.advance_ticket_target() is not None:
+                    stock_check_count = 0
 
     def check_follow(self, run_follow=True):
         resp = self.client.get("https://api.bilibili.com/x/relation?fid=531718444")
@@ -1800,23 +1788,18 @@ class BHYG(metaclass=ProtectedMeta):
                         )
                     )
                 )
-                sentry_sdk.set_tag(
-                    "current_zone", resp.headers["X-Cache-Webcdn"].split("blzone")[1]
-                )
             elif "Via" in resp.headers:
                 info_msg_lines.append(
                     self.i18n("cc_current_zone").format(
                         current_zone=self.i18n("aliyun")
                     )
                 )
-                sentry_sdk.set_tag("current_zone", "aliyun")
             else:
                 info_msg_lines.append(
                     self.i18n("cc_current_zone").format(
                         current_zone=self.i18n("unknown")
                     )
                 )
-                sentry_sdk.set_tag("current_zone", "unknown")
         except Exception as e:
             logger.debug(f"get current zone failed: {e}")
             info_msg_lines.append(
@@ -1893,6 +1876,29 @@ class BHYG(metaclass=ProtectedMeta):
                     ),
                 ]
             )
+            ticket_targets = self.get_ticket_targets()
+            if len(ticket_targets) > 0:
+                info_msg_lines.append(
+                    self.i18n("cc_ticket_targets").format(
+                        ticket_targets="\n"
+                        + "\n".join(
+                            [
+                                "{}. {} (screen_id={}, sku_id={}, price={})".format(
+                                    index + 1,
+                                    target.get("ticket_name")
+                                    or "{} {}".format(
+                                        target.get("screen_name", ""),
+                                        target.get("sku_desc", ""),
+                                    ).strip(),
+                                    target.get("screen_id"),
+                                    target.get("sku_id"),
+                                    int(target.get("price", 0)) / 100,
+                                )
+                                for index, target in enumerate(ticket_targets)
+                            ]
+                        )
+                    )
+                )
             ID_BIND_TYPE = {
                 0: self.i18n("id_bind_type_0"),
                 1: self.i18n("id_bind_type_1"),
@@ -1983,5 +1989,9 @@ class BHYG(metaclass=ProtectedMeta):
         return "\n".join(info_msg_lines)
 
     def calculate_pay_money(self):
-        # TODO: Calculate pay money according to the sku_id and count, and return the pay money.
+        ticket_targets = self.get_ticket_targets()
+        if len(ticket_targets) > 0:
+            target = self.apply_ticket_target()
+            if target is not None:
+                return int(target.get("price", 0)) * int(self.config["count"])
         return self.config["pay_money"] * self.config["count"]
